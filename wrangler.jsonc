@@ -4,6 +4,8 @@
   "main": "src/index.js",
   "compatibility_date": "2026-09-26",
   "observability": {
-    "logs": { "enabled": true }
+    "enabled": true,
+    "head_sampling_rate": 1
   }
 }
+
