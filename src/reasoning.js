@@ -156,7 +156,11 @@ const REASONING_EFFORT_ENUMS = {
   'nvidia/nemotron-3-ultra-550b-a55b': ['low'],
   'minimaxai/minimax-m3': ['adaptive'],
   'moonshotai/kimi-k3': ['low', 'high', 'max'],
-  'meta/muse-glimmer-30b': ['none', 'minimal', 'low', 'medium', 'high', 'max']
+  'meta/muse-glimmer-30b': ['none', 'minimal', 'low', 'medium', 'high', 'max'],
+  // GLM-5 family only accepts these two effort levels once thinking is on;
+  // it does not support 'low'/'medium'.
+  'z-ai/glm-5.3': ['high', 'max'],
+  'z-ai/glm-5-3-flash': ['high', 'max']
 };
 
 function validReasoningEffort(model, effort) {
@@ -249,6 +253,32 @@ function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTo
     case 'moonshotai/kimi-k3': {
       if (effort) return { reasoning_effort: effort };
       return { reasoning_effort: enableThinking ? 'high' : 'low' };
+    }
+
+    case 'z-ai/glm-5.3':
+    case 'z-ai/glm-5-3-flash': {
+      // GLM-5 reasons ("thinks") by default on hosted NIM — unlike every
+      // other model here, silence (an empty payload) does NOT mean "no
+      // reasoning", it means "use GLM's own default", which is thinking
+      // ON. That hidden reasoning pass runs before any visible text
+      // streams out, which is what reads as slow/bursty in a client like
+      // Janitor. NIM gates this with boolean chat_template_kwargs
+      // (enable_thinking/clear_thinking), not the generic reasoning_effort
+      // field — and nested reasoning_effort inside chat_template_kwargs is
+      // ignored by the hosted endpoint, so it has to be top-level.
+      if (!enableThinking) {
+        return { chat_template_kwargs: { enable_thinking: false, clear_thinking: true } };
+      }
+      // GLM-5 only accepts 'high' or 'max' for reasoning_effort. Leaving it
+      // unset doesn't mean "moderate" — it means "whatever NIM's own
+      // default is", which may well be 'max' (the slowest option, and one
+      // a client like Janitor has no way to dial back itself). Default to
+      // 'high' explicitly so thinking-on requests aren't paying for 'max'
+      // depth unless something actually asked for it.
+      return {
+        chat_template_kwargs: { enable_thinking: true, clear_thinking: false },
+        reasoning_effort: effort || 'high' // top-level, per NIM's GLM-5 handling
+      };
     }
 
     default:
