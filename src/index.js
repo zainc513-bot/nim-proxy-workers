@@ -214,7 +214,14 @@ class SSEReformatter {
 
     try {
       const data = JSON.parse(line.slice(6));
-      const delta = (data.choices && data.choices) ? data.choices.delta : null;
+      // BUGFIX: data.choices is an array — .delta lived on data.choices[0],
+      // not on the array itself. The old `data.choices && data.choices`
+      // check was always truthy but `.delta` on an array is always
+      // undefined, so this whole block was silently skipped for every
+      // streamed chunk (no reasoning normalization, no inline <thinking>
+      // composition, no tool-call-leak recovery on the stream).
+      const choice = (data.choices && data.choices[0]) ? data.choices[0] : null;
+      const delta = choice ? choice.delta : null;
 
       if (delta) {
         const normalizedDelta = this.normalizer.processDelta(delta);
@@ -224,8 +231,8 @@ class SSEReformatter {
         clientContent = recoveredContent;
         if (toolCallDeltas.length > 0) {
           delta.tool_calls = toolCallDeltas;
-          if (data.choices && data.choices) {
-            data.choices.finish_reason = 'tool_calls';
+          if (choice) {
+            choice.finish_reason = 'tool_calls';
           }
         }
 
@@ -370,7 +377,7 @@ function createSSEBody(upstreamBody, reformatter) {
 }
 
 function homepageResponse() {
-  const html = 'Proxy OnlinePoint tools to /v1/chat/completions';
+  const html = 'Proxy online. Point tools to /v1/chat/completions';
   return new Response(html, { headers: corsHeaders({ 'Content-Type': 'text/html; charset=utf-8' }) });
 }
 
@@ -532,7 +539,7 @@ export default {
     const path = url.pathname;
 
     if (path === '/') return homepageResponse();
-    if (path === '/health') return jsonResponse({ status: 'ok', version: '2.6.0-workers' });
+    if (path === '/health') return jsonResponse({ status: 'ok', version: '2.6.1-workers' });
     if (path === '/v1/models' && request.method === 'GET') return handleModels(request, env);
 
     if (!PUBLIC_PATHS.has(path)) {
