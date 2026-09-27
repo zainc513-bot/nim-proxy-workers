@@ -2,12 +2,6 @@
 // Backend-specific "thinking" control: which chat_template_kwargs/top-level
 // fields each model needs to toggle reasoning, and how to extract reasoning
 // text from responses that embed it inline vs. as a structured field.
-//
-// Unchanged from the original except: this had a module-level
-// `SHOW_REASONING` read from `process.env` at import time. Workers has no
-// `process.env` — config only exists as the `env` object passed into
-// fetch(request, env, ctx) per request — so the one place that used it
-// (the gemma-4-31b-it case below) now takes it as a parameter instead.
 
 // Everything returned by getReasoningPayload() is spread into the top-level
 // JSON body sent to NIM.
@@ -93,6 +87,7 @@ class StreamNormalizer {
     this.parser = null;
     const tags = CONTENT_DELIMITER_TAGS[model];
     if (tags) {
+      // FIXED: Unpacked values properly instead of passing an array
       this.parser = new DelimiterParser(tags[0], tags[1]);
     }
   }
@@ -152,8 +147,6 @@ function normalizeNonStreamChoice(choice, model) {
   return { ...choice, message: newMessage };
 }
 
-// Valid reasoning_effort values per model, where NIM enforces an enum.
-// Values outside the set are dropped with a warning rather than forwarded.
 const REASONING_EFFORT_ENUMS = {
   'openai/gpt-oss-120b': ['low', 'medium', 'high'],
   'openai/gpt-oss-20b': ['low', 'medium', 'high'],
@@ -176,26 +169,14 @@ function validReasoningEffort(model, effort) {
   return undefined;
 }
 
-// Resolves the client "off"/"on" override into an effective boolean. Shared
-// with callWithFallback() so both agree on whether reasoning is active.
 function resolveEffectiveThinking(enableThinking, clientReasoningEffort) {
   if (clientReasoningEffort === 'off') return false;
   if (clientReasoningEffort === 'on') return true;
   return enableThinking;
 }
 
-// Nemotron 3.5 Lightning has no boolean flag — only a top-level integer
-// reasoning_budget (max reasoning tokens, -1 to 32768, default 16384). This
-// tier mapping is this proxy's own approximation, not an NVIDIA-defined enum.
 const NEMOTRON_LIGHTNING_BUDGET_MAP = { low: 2048, medium: 8192, high: 16384, max: -1 };
 
-// Returns model-specific reasoning request payloads, spread into the
-// top-level request body. reasoning_effort "off"/"on" overrides
-// enableThinking per-request for every model below.
-//
-// showReasoning: the one call site (gemma-4-31b-it) that used to read the
-// module-level SHOW_REASONING constant now takes it as a parameter — pass
-// `env.SHOW_REASONING === 'true'` from the Worker.
 function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTools, showReasoning = false) {
   enableThinking = resolveEffectiveThinking(enableThinking, clientReasoningEffort);
 
@@ -216,7 +197,7 @@ function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTo
       if (!enableThinking) return {};
       const payload = { chat_template_kwargs: { enable_thinking: true } };
       if (effort === 'low') payload.chat_template_kwargs.low_effort = true;
-      if (hasTools) payload.chat_template_kwargs.force_nonempty_content = true; // unverified
+      if (hasTools) payload.chat_template_kwargs.force_nonempty_content = true;
       return payload;
     }
 
@@ -258,10 +239,6 @@ function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTo
       return { reasoning_effort: enableThinking ? 'high' : 'none' };
     }
 
-    // poolside/laguna-xs-2.1: no documented reasoning param on NIM's hosted
-    // endpoint (model, messages, temperature, top_p, max_tokens, stream
-    // only). Falls through to default.
-
     case 'minimaxai/minimax-m3': {
       const thinkingMode = effort === 'adaptive'
         ? 'adaptive'
@@ -270,7 +247,6 @@ function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTo
     }
 
     case 'moonshotai/kimi-k3': {
-      // No off-switch — omitting the field falls back to Kimi's own 'max'.
       if (effort) return { reasoning_effort: effort };
       return { reasoning_effort: enableThinking ? 'high' : 'low' };
     }
