@@ -111,11 +111,12 @@ async function sendDiscordAlert(env, invalidModels) {
 if (!env.DISCORD_WEBHOOK_URL) return;
 const embed = {
 title: '⚠️ NIM Proxy: Model Validation Failed',
-description: \${invalidModels.length} model(s) failed validation.,
+description: ${invalidModels.length} model(s) failed validation.,
 color: 0xff4444,
 timestamp: new Date().toISOString(),
 fields: invalidModels.map(m => ({
-name: \${m.alias}`, value: Backend: `${m.nimId}`\nError: `${m.error}``,
+name: ${m.alias},
+value: Backend: ${m.nimId}\nError: ${m.error},
 inline: true
 }))
 };
@@ -190,7 +191,7 @@ return out;
 }
 try {
 const data = JSON.parse(line.slice(6));
-const delta = (data.choices && data.choices[0]) ? data.choices[0].delta : null;
+const delta = (data.choices && data.choices) ? data.choices.delta : null;
 if (delta) {
 const normalizedDelta = this.normalizer.processDelta(delta);
 let clientContent = this._composeContent(normalizedDelta.content, normalizedDelta.reasoning);
@@ -198,8 +199,8 @@ const { content: recoveredContent, toolCallDeltas } = this.toolRecovery.process(
 clientContent = recoveredContent;
 if (toolCallDeltas.length > 0) {
 delta.tool_calls = toolCallDeltas;
-if (data.choices && data.choices[0]) {
-data.choices[0].finish_reason = 'tool_calls';
+if (data.choices && data.choices) {
+data.choices.finish_reason = 'tool_calls';
 }
 }
 delta.content = clientContent;
