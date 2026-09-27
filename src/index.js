@@ -5,6 +5,11 @@ const MAX_TOKENS_LIMIT = 65536;
 const VALIDATION_TIMEOUT_MS = 15000;
 const MAX_BUFFER_SIZE = 1024 * 1024;
 
+// Default NIM base URL — must match what server.js used
+// ('https://integrate.api.nvidia.com/v1'). Everything below assumes this
+// already includes the /v1 prefix, e.g. nimBase(env) + '/chat/completions'.
+const DEFAULT_NIM_API_BASE = 'https://integrate.api.nvidia.com/v1';
+
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'nvidia/nemotron-3-super-120b-a12b',
   'gpt-4': 'nvidia/nemotron-3-ultra-550b-a55b',
@@ -38,6 +43,10 @@ const FALLBACK_MODELS = [
   'nvidia/nemotron-3-super-120b-a12b'
 ];
 
+// In-memory per-isolate cooldown map. NOT shared across isolates/regions —
+// this is a best-effort optimization, same caveat as the original
+// process-local Map on Render/Railway (which also didn't share state across
+// horizontally-scaled instances).
 const modelCooldowns = new Map();
 let didIsolateInit = false;
 
@@ -79,11 +88,16 @@ function extractBearerToken(authHeader) {
   return token || null;
 }
 
+// Constant-time comparison via the Workers-runtime crypto.subtle extension.
+// Falls back to `false` (never silently succeeds) if the API is ever
+// unavailable in a given runtime.
 async function safeTimingEqual(a, b) {
   const encoder = new TextEncoder();
   const aBytes = encoder.encode(a || '');
   const bBytes = encoder.encode(b || '');
   if (aBytes.byteLength !== bBytes.byteLength) {
+    // Still do a same-length compare so the failure path costs about the
+    // same time as a real one, rather than short-circuiting on length.
     await crypto.subtle.timingSafeEqual(aBytes, aBytes);
     return false;
   }
@@ -91,7 +105,7 @@ async function safeTimingEqual(a, b) {
 }
 
 function nimBase(env) {
-  return env.NIM_API_BASE || 'https://nvidia.com';
+  return env.NIM_API_BASE || DEFAULT_NIM_API_BASE;
 }
 
 async function fetchLiveModelIds(env) {
@@ -131,8 +145,8 @@ async function sendDiscordAlert(env, invalidModels) {
     color: 0xff4444,
     timestamp: new Date().toISOString(),
     fields: invalidModels.map(m => ({
-      name: '' + m.alias,
-      value: 'Backend: ' + m.nimId + '\nError: ' + m.error,
+      name: '`' + m.alias + '`',
+      value: 'Backend: `' + m.nimId + '`\nError: ' + m.error,
       inline: true
     }))
   };
@@ -150,6 +164,7 @@ async function sendDiscordAlert(env, invalidModels) {
 
 async function callWithFallback(env, baseRequest, models, enableThinking, clientReasoningEffort, hasTools) {
   let lastError = null;
+  const debug = env.DEBUG_MODE === 'true';
   const showReasoning = env.SHOW_REASONING === 'true';
   const timeoutMs = resolveEffectiveThinking(enableThinking, clientReasoningEffort)
     ? (Number(env.REASONING_REQUEST_TIMEOUT_MS) || 480000)
@@ -161,6 +176,11 @@ async function callWithFallback(env, baseRequest, models, enableThinking, client
   for (const model of attemptOrder) {
     const reasoningPayload = getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTools, showReasoning);
     const fullRequest = { ...baseRequest, model, ...reasoningPayload };
+
+    if (debug) {
+      console.log(`[DEBUG] Attempting ${model} with reasoning payload:`, JSON.stringify(reasoningPayload), `(timeout: ${timeoutMs}ms)`);
+    }
+
     try {
       const upstreamRes = await fetch(nimBase(env) + '/chat/completions', {
         method: 'POST',
@@ -175,6 +195,7 @@ async function callWithFallback(env, baseRequest, models, enableThinking, client
         const status = upstreamRes.status;
         let errBody = null;
         try { errBody = await upstreamRes.json(); } catch {}
+        if (debug) console.log('[DEBUG] Upstream error body:', JSON.stringify(errBody));
         const err = new Error(errBody?.error?.message || 'NIM returned ' + status);
         err.status = status;
         throw err;
@@ -182,8 +203,14 @@ async function callWithFallback(env, baseRequest, models, enableThinking, client
       return { response: upstreamRes, model };
     } catch (err) {
       lastError = err;
+      console.warn('[FALLBACK] Model failed:', model, err.status, err.message);
+      // Same key for every attempt: a 401 means every remaining model would
+      // fail identically, so bail out rather than burning the whole chain.
       if (err.status === 401) throw err;
+      // 403: likely an access-tier issue, not a dead key — cooldown just
+      // this model.
       if (err.status === 403) setCooldown(model, Number(env.ACCESS_DENIED_COOLDOWN_MS) || 300000);
+      // 429: rate limited — short cooldown.
       if (err.status === 429) setCooldown(model, Number(env.RATE_LIMIT_COOLDOWN_MS) || 30000);
     }
   }
@@ -204,6 +231,8 @@ class SSEReformatter {
     const out = [];
     if (!line.startsWith('data: ')) return out;
 
+    // Exact match avoids false-positiving on model output that happens to
+    // contain the literal substring "[DONE]".
     if (line.trim() === 'data: [DONE]') {
       if (!this.doneSent) {
         out.push('data: [DONE]\n\n');
@@ -214,12 +243,6 @@ class SSEReformatter {
 
     try {
       const data = JSON.parse(line.slice(6));
-      // BUGFIX: data.choices is an array — .delta lived on data.choices[0],
-      // not on the array itself. The old `data.choices && data.choices`
-      // check was always truthy but `.delta` on an array is always
-      // undefined, so this whole block was silently skipped for every
-      // streamed chunk (no reasoning normalization, no inline <thinking>
-      // composition, no tool-call-leak recovery on the stream).
       const choice = (data.choices && data.choices[0]) ? data.choices[0] : null;
       const delta = choice ? choice.delta : null;
 
@@ -249,8 +272,9 @@ class SSEReformatter {
 
       out.push('data: ' + JSON.stringify(data) + '\n\n');
     } catch {
+      console.warn('[STREAM] Invalid JSON line:', line.slice(0, 100));
       out.push('data: ' + JSON.stringify({
-        error: { message: 'Upstream sent malformed chunk', type: 'stream_parse_error' }
+        error: { message: 'Upstream sent malformed chunk', type: 'stream_parse_error', details: line.slice(0, 100) }
       }) + '\n\n');
     }
     return out;
@@ -277,11 +301,15 @@ class SSEReformatter {
     return clientContent;
   }
 
+  // Called once the upstream stream ends. Mirrors server.js's 'end' handler:
+  // flush any buffered reasoning/content, close a dangling <thinking> tag,
+  // and always terminate with [DONE] even if upstream never sent one.
   flush() {
     const out = [];
     const flushedDelta = this.normalizer.flush();
     const toolRecoveryLeftover = this.toolRecovery.flush();
     if (toolRecoveryLeftover) {
+      console.warn('[TOOL_CALL_RECOVERY] Stream ended mid <tool_call> tag; flushing raw text instead of dropping it.');
       flushedDelta.content = (flushedDelta.content || '') + toolRecoveryLeftover;
     }
 
@@ -303,8 +331,10 @@ class SSEReformatter {
       }
     }
 
+    // Close an inline <thinking> tag left open if the model was cut off
+    // mid-reasoning.
     if (this.showReasoning && this.inlineReasoning && this.reasoningOpen) {
-      out.push('data: ' + JSON.stringify({ choices: [{ delta: { content: '\n\n' } }] }) + '\n\n');
+      out.push('data: ' + JSON.stringify({ choices: [{ delta: { content: '\n</thinking>\n' } }] }) + '\n\n');
       this.reasoningOpen = false;
     }
 
@@ -341,6 +371,7 @@ function createSSEBody(upstreamBody, reformatter) {
           if (done) break;
           buffer += decoder.decode(value, { stream: true });
           if (buffer.length > MAX_BUFFER_SIZE) {
+            console.error('[STREAM] Buffer overflow, aborting stream');
             controller.enqueue(encoder.encode('data: ' + JSON.stringify({ error: { message: 'Stream buffer overflow', type: 'stream_error' } }) + '\n\n'));
             controller.enqueue(encoder.encode('data: [DONE]\n\n'));
             controller.close();
@@ -363,21 +394,60 @@ function createSSEBody(upstreamBody, reformatter) {
         }
         controller.close();
       } catch (err) {
+        console.error('[STREAM] Upstream error:', err.message);
         try {
-          controller.enqueue(encoder.encode('data: ' + JSON.stringify({ error: { message: 'Stream error encountered', type: 'stream_error' } }) + '\n\n'));
+          controller.enqueue(encoder.encode('data: ' + JSON.stringify({ error: { message: 'Stream interrupted by upstream error', type: 'stream_error' } }) + '\n\n'));
           controller.enqueue(encoder.encode('data: [DONE]\n\n'));
           controller.close();
         } catch {}
       }
     },
     cancel(reason) {
-      console.warn('[STREAM] Disconnected:', reason);
+      console.warn('[STREAM] Client disconnected:', reason);
     }
   });
 }
 
 function homepageResponse() {
-  const html = 'Proxy online. Point tools to /v1/chat/completions';
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nim-to-openai-proxy</title>
+<style>
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #0b0f14;
+    color: #e6edf3;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    text-align: center;
+    padding: 24px;
+  }
+  .card { max-width: 480px; }
+  h1 { font-size: 1.3rem; margin: 0 0 0.75rem; }
+  p { color: #9aa7b2; line-height: 1.55; margin: 0.5rem 0; }
+  code { background: #161b22; padding: 2px 6px; border-radius: 4px; color: #7ee787; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <svg width="44" height="44" viewBox="0 0 24 24" fill="none" style="margin: 0 auto 14px; display: block;">
+      <circle cx="12" cy="12" r="11" stroke="#7ee787" stroke-width="1.5"/>
+      <path d="M7 12.5l3 3 6-6.5" stroke="#7ee787" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+    </svg>
+    <h1>it's up.</h1>
+    <p>this proxies OpenAI-format chat requests to NVIDIA NIM, running on Cloudflare Workers. point any OpenAI-compatible client at it, pick a model with a plain alias (<code>gpt-4</code>, <code>mistral</code>, etc), and it handles model fallback, streaming, and each backend's own reasoning/thinking quirks for you.</p>
+    <p>it's an API, not a website: nothing lives at this root path.</p>
+    <p>send requests to <code>/v1/chat/completions</code> with an <code>Authorization: Bearer &lt;token&gt;</code> header.</p>
+    <p>status check, no token needed: <code>/health</code></p>
+  </div>
+</body>
+</html>`;
   return new Response(html, { headers: corsHeaders({ 'Content-Type': 'text/html; charset=utf-8' }) });
 }
 
@@ -393,8 +463,18 @@ async function handleChatCompletions(request, env) {
 
   try {
     const { model, max_tokens, temperature, stream, reasoning_effort } = body;
-    let primaryModel = MODEL_MAPPING[model] || DEFAULT_MODEL;
+    let primaryModel = MODEL_MAPPING[model];
+    if (!primaryModel) {
+      console.warn(`[PROXY] Unknown model alias "${model}", falling back to default: ${DEFAULT_MODEL}`);
+      primaryModel = DEFAULT_MODEL;
+    }
+
+    // De-dupe: avoids retrying the same model twice if it's also in
+    // FALLBACK_MODELS.
     const modelChain = [...new Set([primaryModel, ...FALLBACK_MODELS])];
+
+    // Forward all client fields except model (replaced per-attempt) and
+    // reasoning_effort (translated per-model by getReasoningPayload).
     const { model: _m, reasoning_effort: _re, ...forwardedFields } = body;
 
     const baseRequest = {
@@ -412,6 +492,8 @@ async function handleChatCompletions(request, env) {
       reasoning_effort,
       !!body.tools
     );
+
+    console.log('[PROXY] Model used:', usedModel);
 
     const inlineReasoning = request.headers.get('x-reasoning-format') === 'inline';
     const showReasoning = env.SHOW_REASONING === 'true';
@@ -450,6 +532,7 @@ async function handleChatCompletions(request, env) {
 
         if (recoveredToolCalls.length > 0) {
           finalMessage.tool_calls = [...(normalizedChoice.message?.tool_calls || []), ...recoveredToolCalls];
+          // null content on tool-call turns matches real OpenAI responses.
           if (!finalMessage.content || !finalMessage.content.trim()) finalMessage.content = null;
         }
 
@@ -473,6 +556,7 @@ async function handleChatCompletions(request, env) {
 
     return jsonResponse(openaiResponse);
   } catch (error) {
+    console.error('[PROXY] Fatal error:', error.message);
     return errorResponse(error.message, 'invalid_request_error', error.status || 500);
   }
 }
@@ -530,6 +614,12 @@ export default {
   async fetch(request, env, ctx) {
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: corsHeaders() });
 
+    // Model-catalog validation runs once per isolate rather than once per
+    // server process (there's no equivalent of a long-lived Node process
+    // here) — a Worker isolate can be recycled more often than a Render
+    // instance under low traffic, so this may fire somewhat more often.
+    // Harmless; it only produces a Discord alert if something is actually
+    // wrong.
     if (!didIsolateInit) {
       didIsolateInit = true;
       ctx.waitUntil(validateModels(env));

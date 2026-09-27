@@ -1,0 +1,15 @@
+{
+  "name": "nim-to-openai-proxy",
+  "version": "1.0.1",
+  "private": true,
+  "description": "OpenAI-compatible proxy for NVIDIA NIM — Cloudflare Workers port",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "latest"
+  }
+}

@@ -87,7 +87,6 @@ class StreamNormalizer {
     this.parser = null;
     const tags = CONTENT_DELIMITER_TAGS[model];
     if (tags) {
-      // FIXED: Unpacked values properly instead of passing an array
       this.parser = new DelimiterParser(tags[0], tags[1]);
     }
   }
@@ -147,6 +146,8 @@ function normalizeNonStreamChoice(choice, model) {
   return { ...choice, message: newMessage };
 }
 
+// Valid reasoning_effort values per model, where NIM enforces an enum.
+// Values outside the set are dropped with a warning rather than forwarded.
 const REASONING_EFFORT_ENUMS = {
   'openai/gpt-oss-120b': ['low', 'medium', 'high'],
   'openai/gpt-oss-20b': ['low', 'medium', 'high'],
@@ -156,11 +157,7 @@ const REASONING_EFFORT_ENUMS = {
   'nvidia/nemotron-3-ultra-550b-a55b': ['low'],
   'minimaxai/minimax-m3': ['adaptive'],
   'moonshotai/kimi-k3': ['low', 'high', 'max'],
-  'meta/muse-glimmer-30b': ['none', 'minimal', 'low', 'medium', 'high', 'max'],
-  // GLM-5 family only accepts these two effort levels once thinking is on;
-  // it does not support 'low'/'medium'.
-  'z-ai/glm-5.3': ['high', 'max'],
-  'z-ai/glm-5-3-flash': ['high', 'max']
+  'meta/muse-glimmer-30b': ['none', 'minimal', 'low', 'medium', 'high', 'max']
 };
 
 function validReasoningEffort(model, effort) {
@@ -173,14 +170,22 @@ function validReasoningEffort(model, effort) {
   return undefined;
 }
 
+// Resolves the client "off"/"on" override into an effective boolean. Shared
+// with callWithFallback() so both agree on whether reasoning is active.
 function resolveEffectiveThinking(enableThinking, clientReasoningEffort) {
   if (clientReasoningEffort === 'off') return false;
   if (clientReasoningEffort === 'on') return true;
   return enableThinking;
 }
 
+// Nemotron 3.5 Lightning has no boolean flag — only a top-level integer
+// reasoning_budget (max reasoning tokens, -1 to 32768, default 16384). This
+// tier mapping is this proxy's own approximation, not an NVIDIA-defined enum.
 const NEMOTRON_LIGHTNING_BUDGET_MAP = { low: 2048, medium: 8192, high: 16384, max: -1 };
 
+// Returns model-specific reasoning request payloads, spread into the
+// top-level request body. reasoning_effort "off"/"on" overrides
+// ENABLE_THINKING_MODE per-request for every model below.
 function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTools, showReasoning = false) {
   enableThinking = resolveEffectiveThinking(enableThinking, clientReasoningEffort);
 
@@ -201,7 +206,7 @@ function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTo
       if (!enableThinking) return {};
       const payload = { chat_template_kwargs: { enable_thinking: true } };
       if (effort === 'low') payload.chat_template_kwargs.low_effort = true;
-      if (hasTools) payload.chat_template_kwargs.force_nonempty_content = true;
+      if (hasTools) payload.chat_template_kwargs.force_nonempty_content = true; // unverified
       return payload;
     }
 
@@ -243,6 +248,10 @@ function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTo
       return { reasoning_effort: enableThinking ? 'high' : 'none' };
     }
 
+    // poolside/laguna-xs-2.1: no documented reasoning param on NIM's hosted
+    // endpoint (model, messages, temperature, top_p, max_tokens, stream
+    // only). Falls through to default.
+
     case 'minimaxai/minimax-m3': {
       const thinkingMode = effort === 'adaptive'
         ? 'adaptive'
@@ -251,34 +260,9 @@ function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTo
     }
 
     case 'moonshotai/kimi-k3': {
+      // No off-switch — omitting the field falls back to Kimi's own 'max'.
       if (effort) return { reasoning_effort: effort };
       return { reasoning_effort: enableThinking ? 'high' : 'low' };
-    }
-
-    case 'z-ai/glm-5.3':
-    case 'z-ai/glm-5-3-flash': {
-      // GLM-5 reasons ("thinks") by default on hosted NIM — unlike every
-      // other model here, silence (an empty payload) does NOT mean "no
-      // reasoning", it means "use GLM's own default", which is thinking
-      // ON. That hidden reasoning pass runs before any visible text
-      // streams out, which is what reads as slow/bursty in a client like
-      // Janitor. NIM gates this with boolean chat_template_kwargs
-      // (enable_thinking/clear_thinking), not the generic reasoning_effort
-      // field — and nested reasoning_effort inside chat_template_kwargs is
-      // ignored by the hosted endpoint, so it has to be top-level.
-      if (!enableThinking) {
-        return { chat_template_kwargs: { enable_thinking: false, clear_thinking: true } };
-      }
-      // GLM-5 only accepts 'high' or 'max' for reasoning_effort. Leaving it
-      // unset doesn't mean "moderate" — it means "whatever NIM's own
-      // default is", which may well be 'max' (the slowest option, and one
-      // a client like Janitor has no way to dial back itself). Default to
-      // 'high' explicitly so thinking-on requests aren't paying for 'max'
-      // depth unless something actually asked for it.
-      return {
-        chat_template_kwargs: { enable_thinking: true, clear_thinking: false },
-        reasoning_effort: effort || 'high' // top-level, per NIM's GLM-5 handling
-      };
     }
 
     default:
